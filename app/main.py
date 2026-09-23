@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from .config import APP_NAME, APP_VERSION
 from .database import init_db
 from .errors import register_exception_handlers
-from .routers import accounts, periods, vouchers
+from .routers import accounts, periods, reports, vouchers
 
 
 @asynccontextmanager
@@ -39,6 +39,7 @@ register_exception_handlers(app)
 app.include_router(accounts.router)
 app.include_router(periods.router)
 app.include_router(vouchers.router)
+app.include_router(reports.router)
 
 
 @app.get("/", tags=["meta"], summary="服务信息")

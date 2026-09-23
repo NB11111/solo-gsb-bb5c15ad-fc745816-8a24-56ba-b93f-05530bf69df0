@@ -203,3 +203,32 @@ class VoucherListOut(BaseModel):
     items: list[VoucherOut]
     limit: int
     next_cursor: Optional[int] = None
+
+
+# ---------------------------------------------------------------- 试算平衡表
+class TrialBalanceLine(BaseModel):
+    account_id: int
+    account_code: str
+    account_name: str
+    account_type: AccountType
+    # 截止期间及此前各期间的累计发生额
+    total_debit: str
+    total_credit: str
+    # 期末余额方向与金额 (二者恰有一个非零，净额为 0 的科目不列出)
+    balance_direction: Literal["debit", "credit"]
+    ending_balance: str
+
+
+class TrialBalanceGroup(BaseModel):
+    currency: str
+    lines: list[TrialBalanceLine]
+    # 组内各科目期末余额的借贷合计
+    total_debit: str
+    total_credit: str
+    balanced: bool
+
+
+class TrialBalanceOut(BaseModel):
+    period: str
+    generated_at: datetime
+    groups: list[TrialBalanceGroup]
