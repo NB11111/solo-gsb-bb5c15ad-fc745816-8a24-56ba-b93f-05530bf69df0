@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from .config import APP_NAME, APP_VERSION
 from .database import init_db
 from .errors import register_exception_handlers
-from .routers import accounts, periods, vouchers
+from .routers import accounts, periods, reports, vouchers
 
 
 @asynccontextmanager
@@ -30,7 +30,7 @@ app = FastAPI(
     description=(
         "科研经费双重记账服务：带币种科目、多分录凭证、事务内借贷平衡校验、"
         "结账期间冻结、不可变凭证、反向凭证冲销、request_id 幂等、"
-        "按科目余额与凭证链查询。金额以整数分存储。"
+        "按科目余额与凭证链查询，以及只读试算平衡表。金额以整数分存储。"
     ),
     lifespan=lifespan,
 )
@@ -39,6 +39,7 @@ register_exception_handlers(app)
 app.include_router(accounts.router)
 app.include_router(periods.router)
 app.include_router(vouchers.router)
+app.include_router(reports.router)
 
 
 @app.get("/", tags=["meta"], summary="服务信息")

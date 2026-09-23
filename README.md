@@ -16,6 +16,7 @@
 - **request_id 幂等**：客户端为每次提交提供唯一键，网络重试/重复提交返回同一凭证（`200` + `X-Idempotent-Replay: true`），余额不重复累计。
 - **余额物化**：按（科目 × 期间）实时维护借贷累计额，过账/冲销在同一事务内 UPSERT。
 - **查询**：科目余额（可按期间）、科目分类账（逐笔累计余额、游标分页）、凭证列表（按科目/期间过滤）、凭证链（原始凭证 ↔ 反向凭证）。
+- **只读试算平衡表**：`GET /reports/trial-balance?period=YYYY-MM`，按币种分组汇总截止期间（含此前各期间）的累计借贷发生额，逐科目给出期末借/贷余额，并给出各币种期末借贷合计与 `balanced` 是否平衡；无余额科目不列出，接口只做 SELECT，不创建期间、不改动账务数据。
 - **并发安全**：SQLite WAL + `BEGIN IMMEDIATE` + `busy_timeout`，写入在事务起点排队；已验证 16 线程并发无锁错误、凭证号不重号。
 
 ## 一键启动（Docker Compose）
@@ -75,6 +76,7 @@ python3 -m pytest -q
 | GET | `/periods` / `/periods/{key}` | 期间列表/详情 |
 | POST | `/periods/{key}/close` | 结账（幂等，冻结入账） |
 | POST | `/periods/{key}/reopen` | 重新打开期间（纠错用） |
+| GET | `/reports/trial-balance?period=YYYY-MM` | 只读试算平衡表（按币种分组，截止期间累计） |
 
 错误统一返回：
 
@@ -136,6 +138,59 @@ curl localhost:8000/accounts/1/ledger
 curl localhost:8000/vouchers/1/chain
 ```
 
+### 5. 试算平衡表（只读）
+
+汇总截止期间（含本期及此前各期间）的累计发生额与期末余额，按币种分组：
+
+```bash
+curl 'localhost:8000/reports/trial-balance?period=2026-09'
+```
+
+```json
+{
+  "period": "2026-09",
+  "currencies": [
+    {
+      "currency": "CNY",
+      "total_debit": "1000000.00",
+      "total_credit": "1000000.00",
+      "balanced": true,
+      "accounts": [
+        {
+          "account_id": 1,
+          "account_code": "1002",
+          "account_name": "银行存款-人民币",
+          "account_type": "asset",
+          "total_debit": "1000000.00",
+          "total_credit": "350000.00",
+          "closing_debit": "650000.00",
+          "closing_credit": "0.00",
+          "balance_direction": "debit"
+        },
+        {
+          "account_id": 5,
+          "account_code": "4001",
+          "account_name": "科研拨款收入",
+          "account_type": "income",
+          "total_debit": "0.00",
+          "total_credit": "1000000.00",
+          "closing_debit": "0.00",
+          "closing_credit": "1000000.00",
+          "balance_direction": "credit"
+        }
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+- 每个科目返回累计借方/贷方发生额（`total_debit` / `total_credit`）及期末借/贷余额（`closing_debit` / `closing_credit`，互斥地只在净额方向有值）和 `balance_direction`；
+- 累计借 = 累计贷（期末无余额）的科目**不列出**；
+- 币种级 `total_debit` / `total_credit` 是该币种全部列示科目的**期末余额合计**，`balanced` 表示二者是否相等；复式记账下各币种应恒为 `true`，否则意味着账套存在脏数据；
+- 该接口只读：不提交事务、不自动创建期间（对比 `GET /periods/{key}` 会自动开账）、不触碰余额与凭证。
+
 ## 关键设计说明
 
 ### 复式记账规则
@@ -162,6 +217,13 @@ curl localhost:8000/vouchers/1/chain
 
 API 边界使用字符串（正则限定非负、最多两位小数），服务端用 `Decimal` 转为整数分存储（`app/money.py`），比较与汇总全部为整数运算。
 
+### 试算平衡表（只读报表）
+
+- 数据直接来自物化的 `balances` 表：`WHERE period_key <= 截止期` 按科目 `SUM(debit_minor)/SUM(credit_minor)`，一次查询拿到全部科目累计额，再在内存按币种分组；
+- 期末余额 = 累计借 − 累计贷：为正列借方余额，为负列贷方余额，为 0 的科目不列出；
+- 币种级合计只汇总期末余额（不是发生额），`balanced = 借方合计 = 贷方合计`；
+- 由于凭证按币种自平衡（一张凭证不允许跨币种），各币种在无脏数据时恒平衡。服务层只做 SELECT、不 commit，也不会像 `GET /periods/{key}` 那样隐式创建期间。
+
 ## 项目结构
 
 ```
@@ -176,9 +238,9 @@ API 边界使用字符串（正则限定非负、最多两位小数），服务�
 │   ├── errors.py            # 统一业务异常
 │   ├── serializers.py       # ORM -> 响应模型
 │   ├── seed.py              # 演示账套 (幂等)
-│   ├── routers/             # accounts / periods / vouchers
-│   └── services/            # master_data（科目/期间）、voucher（过账/冲销/查询）
-├── tests/test_api.py        # 12 组端到端测试
+│   ├── routers/             # accounts / periods / vouchers / reports
+│   └── services/            # master_data（科目/期间）、voucher（过账/冲销/查询）、reports（只读报表）
+├── tests/test_api.py        # 18 组端到端测试
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml

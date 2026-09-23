@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from app.database import SessionLocal
-from app.models import Voucher
+from app.models import Balance, Period, Voucher
 
 
 def _create_account(client, code, name, currency="CNY", atype="asset"):
@@ -339,3 +339,165 @@ def test_list_and_filter_vouchers(client):
 
     period_filtered = client.get("/vouchers", params={"period": "2026-09"}).json()
     assert len(period_filtered["items"]) == 2
+
+
+def _tb_map(resp):
+    """试算平衡表响应 -> {currency: {account_code: account, ...}}, 并校验结构。"""
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return body, {g["currency"]: {a["account_code"]: a for a in g["accounts"]}
+                  for g in body["currencies"]}
+
+
+def test_trial_balance_cumulative_cutoff_and_balanced(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    # 8 月 100 / 9 月 20
+    _post_voucher(client, "tb-1", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "100.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "100.00"},
+    ], vdate="2026-08-10")
+    _post_voucher(client, "tb-2", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "20.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "20.00"},
+    ], vdate="2026-09-05")
+
+    # 截止 8 月：仅累计 8 月发生额
+    body, groups = _tb_map(client.get("/reports/trial-balance", params={"period": "2026-08"}))
+    assert body["period"] == "2026-08"
+    assert set(groups) == {"CNY"}
+    cny = next(g for g in body["currencies"] if g["currency"] == "CNY")
+    assert cny["total_debit"] == "100.00"
+    assert cny["total_credit"] == "100.00"
+    assert cny["balanced"] is True
+    assert groups["CNY"]["1002"]["total_debit"] == "100.00"
+    assert groups["CNY"]["1002"]["total_credit"] == "0.00"
+    assert groups["CNY"]["1002"]["closing_debit"] == "100.00"
+    assert groups["CNY"]["1002"]["closing_credit"] == "0.00"
+    assert groups["CNY"]["1002"]["balance_direction"] == "debit"
+    assert groups["CNY"]["4001"]["balance_direction"] == "credit"
+    assert groups["CNY"]["4001"]["closing_credit"] == "100.00"
+
+    # 截止 9 月：累计 8+9 月
+    body, groups = _tb_map(client.get("/reports/trial-balance", params={"period": "2026-09"}))
+    cny = next(g for g in body["currencies"] if g["currency"] == "CNY")
+    assert cny["balanced"] is True
+    assert groups["CNY"]["1002"]["total_debit"] == "120.00"
+    assert groups["CNY"]["4001"]["closing_credit"] == "120.00"
+
+    # 更早的截止期 (7 月)：尚无任何发生额 -> 空币种列表
+    body = client.get("/reports/trial-balance", params={"period": "2026-07"}).json()
+    assert body["currencies"] == []
+
+
+def test_trial_balance_multi_currency_groups(client):
+    cny_bank = _create_account(client, "1002", "人民币户", "CNY")
+    cny_income = _create_account(client, "4001", "科研拨款", atype="income")
+    usd_bank = _create_account(client, "1003", "美元户", "USD")
+    usd_income = _create_account(client, "4002", "美元资助", "USD", atype="income")
+
+    _post_voucher(client, "tb-cny", [
+        {"account_id": cny_bank["id"], "direction": "debit", "amount": "1000.00"},
+        {"account_id": cny_income["id"], "direction": "credit", "amount": "1000.00"},
+    ])
+    _post_voucher(client, "tb-usd", [
+        {"account_id": usd_bank["id"], "direction": "debit", "amount": "50.00"},
+        {"account_id": usd_income["id"], "direction": "credit", "amount": "50.00"},
+    ], currency="USD")
+
+    body, groups = _tb_map(client.get("/reports/trial-balance", params={"period": "2026-09"}))
+    assert set(groups) == {"CNY", "USD"}
+    by_cur = {g["currency"]: g for g in body["currencies"]}
+    assert by_cur["CNY"]["total_debit"] == "1000.00"
+    assert by_cur["CNY"]["balanced"] is True
+    assert by_cur["USD"]["total_debit"] == "50.00"
+    assert by_cur["USD"]["total_credit"] == "50.00"
+    assert by_cur["USD"]["balanced"] is True
+    # 币种按字母序，科目按代码序
+    assert [g["currency"] for g in body["currencies"]] == ["CNY", "USD"]
+
+
+def test_trial_balance_excludes_zero_balance_accounts(client):
+    bank = _create_account(client, "1002", "银行存款")
+    expense = _create_account(client, "5001", "科研设备费", atype="expense")
+
+    # 8 月入账，9 月跨期冲销；两个科目累计借贷相等、净额归零
+    original = _post_voucher(client, "tb-rev-base", [
+        {"account_id": expense["id"], "direction": "debit", "amount": "800.00"},
+        {"account_id": bank["id"], "direction": "credit", "amount": "800.00"},
+    ], vdate="2026-08-20").json()
+    client.post(f"/vouchers/{original['id']}/reverse", json={
+        "request_id": "tb-rev-1", "date": "2026-09-02",
+    })
+
+    body, groups = _tb_map(client.get("/reports/trial-balance", params={"period": "2026-09"}))
+    # 两个科目期末余额都是 0，不列出 -> 无币种分组
+    assert groups == {}
+    assert body["currencies"] == []
+
+
+def test_trial_balance_invalid_period(client):
+    # 缺少必填 period
+    assert client.get("/reports/trial-balance").status_code == 422
+    # 格式非法
+    r = client.get("/reports/trial-balance", params={"period": "2026-9"})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "unprocessable_entity"
+    r = client.get("/reports/trial-balance", params={"period": "2026-13"})
+    assert r.status_code == 422
+
+
+def test_trial_balance_is_read_only(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+    _post_voucher(client, "tb-ro", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "100.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "100.00"},
+    ])
+
+    # 查询一个从未来过账的截止期，不得自动创建该期间 (对比 GET /periods 的行为)
+    assert client.get("/periods/2027-01").status_code == 200  # 该端点会自动开账
+    client.get("/reports/trial-balance", params={"period": "2027-02"})
+
+    db = SessionLocal()
+    try:
+        keys = {p.key for p in db.query(Period).all()}
+        assert "2027-01" in keys       # periods 端点创建的
+        assert "2027-02" not in keys   # 试算平衡表没有创建任何期间
+        balances = db.query(Balance).all()
+        # 仍只有入账产生的两个余额行，没有被查询改写
+        assert len(balances) == 2
+    finally:
+        db.close()
+
+    # 再查一次，结果幂等不变
+    r1 = client.get("/reports/trial-balance", params={"period": "2026-09"}).json()
+    r2 = client.get("/reports/trial-balance", params={"period": "2026-09"}).json()
+    assert r1 == r2
+
+
+def test_trial_balance_detects_unbalanced_currency(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+    _post_voucher(client, "tb-unbal", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "100.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "100.00"},
+    ])
+
+    # 正常账务必平衡；直接在更早期间写入一笔脏余额模拟借贷合计不等
+    db = SessionLocal()
+    try:
+        db.add(Balance(
+            account_id=bank["id"], period_key="2026-07",
+            debit_minor=3000, credit_minor=0,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    body, _ = _tb_map(client.get("/reports/trial-balance", params={"period": "2026-09"}))
+    cny = next(g for g in body["currencies"] if g["currency"] == "CNY")
+    assert cny["total_debit"] == "130.00"
+    assert cny["total_credit"] == "100.00"
+    assert cny["balanced"] is False

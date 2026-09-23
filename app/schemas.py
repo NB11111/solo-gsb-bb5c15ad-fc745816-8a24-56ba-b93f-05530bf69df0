@@ -203,3 +203,30 @@ class VoucherListOut(BaseModel):
     items: list[VoucherOut]
     limit: int
     next_cursor: Optional[int] = None
+
+
+# ---------------------------------------------------------------- 试算平衡表
+class TrialBalanceAccountOut(BaseModel):
+    account_id: int
+    account_code: str
+    account_name: str
+    account_type: AccountType
+    total_debit: str        # 截止期末累计借方发生额
+    total_credit: str       # 截止期末累计贷方发生额
+    closing_debit: str      # 期末借方余额 (借>贷 时为差额，否则 "0.00")
+    closing_credit: str     # 期末贷方余额 (贷>借 时为差额，否则 "0.00")
+    balance_direction: Literal["debit", "credit"]  # 期末余额方向
+
+
+class TrialBalanceCurrencyOut(BaseModel):
+    currency: str
+    # 该币种全部列示科目的期末借/贷余额合计
+    total_debit: str
+    total_credit: str
+    balanced: bool          # 期末借方合计 == 期末贷方合计
+    accounts: list[TrialBalanceAccountOut]
+
+
+class TrialBalanceOut(BaseModel):
+    period: str             # 截止期间 YYYY-MM (含本期及此前各期间)
+    currencies: list[TrialBalanceCurrencyOut]
